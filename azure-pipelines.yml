@@ -4,7 +4,7 @@ trigger:
       - main
 
 pool:
-  vmImage: ubuntu-latest
+  name: do-pool
 
 variables:
   sshConnection: 'DO-SSH'
@@ -12,7 +12,7 @@ variables:
   nginxConfDir: '/home/linuxbrew/.linuxbrew/etc/nginx/conf.d'
 
 steps:
-# 1) Ensure the server is ready (idempotent)
+# 1) Prepare DigitalOcean droplet (idempotent)
 - task: SSH@0
   displayName: '🛠️ Prepare DO droplet'
   inputs:
@@ -21,20 +21,20 @@ steps:
     inline: |
       set -e
 
-      # Install runtime deps
+      # Install runtime dependencies
       sudo dnf install -y python3 python3-pip git
 
-      # Make sure app directory exists & owned by adarsh
+      # Ensure application directory exists and is owned by adarsh
       sudo mkdir -p $(appDir)
       sudo chown -R adarsh:adarsh $(appDir)
 
-      # Ensure nginx via Homebrew
+      # Install or verify nginx via Homebrew
       export PATH=/home/linuxbrew/.linuxbrew/bin:$PATH
       if ! command -v nginx &>/dev/null; then
         brew install nginx
       fi
 
-      # Create systemd service
+      # Create systemd service for Flask app
       sudo tee /etc/systemd/system/hello-app.service > /dev/null << 'EOF'
       [Unit]
       Description=Flask Hello-World App
@@ -54,7 +54,7 @@ steps:
       sudo systemctl daemon-reload
       sudo systemctl enable hello-app
 
-      # Nginx reverse proxy
+      # Configure nginx reverse proxy
       sudo mkdir -p $(nginxConfDir)
       sudo tee $(nginxConfDir)/hello.conf > /dev/null << 'EOF'
       server {
@@ -69,7 +69,7 @@ steps:
       }
       EOF
 
-      # Restart nginx
+      # Restart nginx to apply configuration
       brew services restart nginx
 
 # 2) Deploy on each push
@@ -89,5 +89,8 @@ steps:
         git reset --hard origin/main
       fi
 
+      # Install or upgrade Python dependencies
       pip3 install --upgrade -r requirements.txt
+
+      # Restart the Flask service
       sudo systemctl restart hello-app
