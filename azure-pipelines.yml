@@ -12,87 +12,90 @@ variables:
   nginxConfDir: '/etc/nginx/conf.d'
 
 steps:
-# 1) Prepare DigitalOcean droplet (idempotent)
-- task: SSH@0
-  displayName: '🛠️ Prepare DO droplet'
-  inputs:
-    sshEndpoint: $(sshConnection)
-    runOptions: inline
-    inline: |
-      set -e
+  # 1) Prepare DigitalOcean droplet (idempotent)
+  - task: SSH@0
+    displayName: '🛠️ Prepare DO droplet'
+    inputs:
+      sshEndpoint: $(sshConnection)
+      runOptions: inline
+      inline: |
+        set -e
 
-      # Install runtime dependencies and Nginx
-      sudo yum install -y python3 python3-pip git nginx
+        # Install runtime dependencies and Nginx
+        sudo yum install -y python3 python3-pip git nginx
 
-      # Ensure application directory exists and is owned by adarsh
-      sudo mkdir -p $(appDir)
-      sudo chown -R adarsh:adarsh $(appDir)
+        # Ensure application directory exists and is owned by adarsh
+        sudo mkdir -p $(appDir)
+        sudo chown -R adarsh:adarsh $(appDir)
 
-      # Create Python virtual environment if it doesn't exist
-      if [ ! -d $(appDir)/venv ]; then
-        sudo -u adarsh python3 -m venv $(appDir)/venv
-      fi
+        # Create Python virtual environment if it doesn't exist
+        if [ ! -d $(appDir)/venv ]; then
+          sudo -u adarsh python3 -m venv $(appDir)/venv
+        fi
 
-      # Enable and start Nginx
-      sudo systemctl enable nginx
-      sudo systemctl start nginx
+        # Enable and start Nginx
+        sudo systemctl enable nginx
+        sudo systemctl start nginx
 
-      # Create systemd service for Flask app
-      sudo tee /etc/systemd/system/hello-app.service > /dev/null << 'EOF'
-      [Unit]
-      Description=Flask Hello-World App
-      After=network.target
+        # Create systemd service for Flask app
+        sudo tee /etc/systemd/system/hello-app.service > /dev/null << 'EOF'
+        [Unit]
+        Description=Flask Hello-World App
+        After=network.target
 
-      [Service]
-      WorkingDirectory=$(appDir)
-      ExecStart=$(appDir)/venv/bin/python $(appDir)/app.py
-      Restart=always
-      User=adarsh
-      Environment=PATH=/usr/bin:$(appDir)/venv/bin
+        [Service]
+        WorkingDirectory=$(appDir)
+        ExecStart=$(appDir)/venv/bin/python $(appDir)/app.py
+        Restart=always
+        User=adarsh
+        Environment=PATH=/usr/bin:$(appDir)/venv/bin
 
-      [Install]
-      WantedBy=multi-user.target
-      EOF
+        [Install]
+        WantedBy=multi-user.target
+        EOF
 
-      sudo systemctl daemon-reload
-      sudo systemctl enable hello-app
+        sudo systemctl daemon-reload
+        sudo systemctl enable hello-app
 
-      # Configure Nginx reverse proxy
-      sudo mkdir -p $(nginxConfDir)
-      sudo tee $(nginxConfDir)/hello.conf > /dev/null << 'EOF'
-      server {
-          listen 80;
-          server_name _;
+        # Configure Nginx reverse proxy
+        sudo mkdir -p $(nginxConfDir)
+        sudo tee $(nginxConfDir)/hello.conf > /dev/null << 'EOF'
+        server {
+            listen 80;
+            server_name _;
 
-          location / {
-              proxy_pass http://127.0.0.1:5000;
-              proxy_set_header Host $host;
-              proxy_set_header X-Real-IP $remote_addr;
-          }
-      }
-      EOF
+            location / {
+                proxy_pass http://127.0.0.1:5000;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+            }
+        }
+        EOF
 
-      sudo systemctl reload nginx
+        sudo systemctl reload nginx
 
-# 2) Deploy application code on each push
-- task: SSH@0
-  displayName: '🚀 Deploy App'
-  inputs:
-    sshEndpoint: $(sshConnection)
-    runOptions: inline
-    inline: |
-      set -e
+  # 2) Deploy application code on each push
+  - task: SSH@0
+    displayName: '🚀 Deploy App'
+    inputs:
+      sshEndpoint: $(sshConnection)
+      runOptions: inline
+      inline: |
+        set -e
 
-      cd $(appDir)
-      if [ ! -d .git ]; then
-        git clone https://github.com/adarshkrishna754/hello-world-flask.git .
-      else
-        git fetch --all
-        git reset --hard origin/main
-      fi
+        cd $(appDir)
+        if [ ! -d .git ]; then
+          git clone https://github.com/adarshkrishna754/hello-world-flask.git .
+        else
+          git fetch --all
+          git reset --hard origin/main
+        fi
 
-      # Install or upgrade Python dependencies in venv
-      sudo -u adarsh $(appDir)/venv/bin/pip install --upgrade -r requirements.txt
+        # Upgrade pip to avoid version warnings
+        sudo -u adarsh $(appDir)/venv/bin/python -m pip install --upgrade pip
 
-      # Restart the Flask service
-      sudo systemctl restart hello-app
+        # Install or upgrade Python dependencies in venv
+        sudo -u adarsh $(appDir)/venv/bin/pip install --upgrade -r requirements.txt
+
+        # Restart the Flask service
+        sudo systemctl restart hello-app
