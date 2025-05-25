@@ -1,0 +1,93 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  sshConnection: 'DO-SSH'
+  appDir: '/home/adarsh/hello-world-flask'
+  nginxConfDir: '/home/linuxbrew/.linuxbrew/etc/nginx/conf.d'
+
+steps:
+# 1) Ensure the server is ready (idempotent)
+- task: SSH@0
+  displayName: '🛠️ Prepare DO droplet'
+  inputs:
+    sshEndpoint: $(sshConnection)
+    runOptions: inline
+    inline: |
+      set -e
+
+      # Install runtime deps
+      sudo dnf install -y python3 python3-pip git
+
+      # Make sure app directory exists & owned by adarsh
+      sudo mkdir -p $(appDir)
+      sudo chown -R adarsh:adarsh $(appDir)
+
+      # Ensure nginx via Homebrew
+      export PATH=/home/linuxbrew/.linuxbrew/bin:$PATH
+      if ! command -v nginx &>/dev/null; then
+        brew install nginx
+      fi
+
+      # Create systemd service
+      sudo tee /etc/systemd/system/hello-app.service > /dev/null << 'EOF'
+      [Unit]
+      Description=Flask Hello-World App
+      After=network.target
+
+      [Service]
+      WorkingDirectory=$(appDir)
+      ExecStart=/usr/bin/python3 app.py
+      Restart=always
+      User=adarsh
+      Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/bin
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+
+      sudo systemctl daemon-reload
+      sudo systemctl enable hello-app
+
+      # Nginx reverse proxy
+      sudo mkdir -p $(nginxConfDir)
+      sudo tee $(nginxConfDir)/hello.conf > /dev/null << 'EOF'
+      server {
+        listen 80;
+        server_name _;
+
+        location / {
+          proxy_pass http://127.0.0.1:5000;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+        }
+      }
+      EOF
+
+      # Restart nginx
+      brew services restart nginx
+
+# 2) Deploy on each push
+- task: SSH@0
+  displayName: '🚀 Deploy App'
+  inputs:
+    sshEndpoint: $(sshConnection)
+    runOptions: inline
+    inline: |
+      set -e
+
+      cd $(appDir)
+      if [ ! -d .git ]; then
+        git clone https://github.com/adarshkrishna754/hello-world-flask.git .
+      else
+        git fetch --all
+        git reset --hard origin/main
+      fi
+
+      pip3 install --upgrade -r requirements.txt
+      sudo systemctl restart hello-app
