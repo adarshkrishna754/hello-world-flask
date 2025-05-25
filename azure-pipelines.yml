@@ -9,7 +9,7 @@ pool:
 variables:
   sshConnection: 'DO-SSH'
   appDir: '/home/adarsh/hello-world-flask'
-  nginxConfDir: '/home/linuxbrew/.linuxbrew/etc/nginx/conf.d'
+  nginxConfDir: '/etc/nginx/conf.d'
 
 steps:
 # 1) Prepare DigitalOcean droplet (idempotent)
@@ -21,18 +21,16 @@ steps:
     inline: |
       set -e
 
-      # Install runtime dependencies
-      sudo dnf install -y python3 python3-pip git
+      # Install runtime dependencies and Nginx
+      sudo yum install -y python3 python3-pip git nginx
 
       # Ensure application directory exists and is owned by adarsh
       sudo mkdir -p $(appDir)
       sudo chown -R adarsh:adarsh $(appDir)
 
-      # Install or verify nginx via Homebrew
-      export PATH=/home/linuxbrew/.linuxbrew/bin:$PATH
-      if ! command -v nginx &>/dev/null; then
-        brew install nginx
-      fi
+      # Enable and start Nginx
+      sudo systemctl enable nginx
+      sudo systemctl start nginx
 
       # Create systemd service for Flask app
       sudo tee /etc/systemd/system/hello-app.service > /dev/null << 'EOF'
@@ -45,7 +43,7 @@ steps:
       ExecStart=/usr/bin/python3 app.py
       Restart=always
       User=adarsh
-      Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/bin
+      Environment=PATH=/usr/bin
 
       [Install]
       WantedBy=multi-user.target
@@ -54,7 +52,7 @@ steps:
       sudo systemctl daemon-reload
       sudo systemctl enable hello-app
 
-      # Configure nginx reverse proxy
+      # Configure Nginx reverse proxy
       sudo mkdir -p $(nginxConfDir)
       sudo tee $(nginxConfDir)/hello.conf > /dev/null << 'EOF'
       server {
@@ -69,8 +67,8 @@ steps:
       }
       EOF
 
-      # Restart nginx to apply configuration
-      brew services restart nginx
+      # Reload Nginx to apply configuration
+      sudo systemctl reload nginx
 
 # 2) Deploy on each push
 - task: SSH@0
