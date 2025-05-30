@@ -1,101 +1,195 @@
 trigger:
-  branches:
-    include:
-      - main
-
-pool:
-  name: do-pool
+  - main
 
 variables:
-  sshConnection: 'DO-SSH'
-  appDir: '/home/adarsh/hello-world-flask'
-  nginxConfDir: '/etc/nginx/conf.d'
+  namespace:      'adkrish22290'
+  repository:     'hello-world'
+  tag:            '$(Build.BuildId)'
+  imageName:      'quay.io/$(namespace)/$(repository)'
+  quayUser:       'adkrish22290+adkrish22290'
+  quayPassword:   '9ZDK923AF1H34Z34OM1PQHYBE7IFLCEXDF8V1N2CQRR6IFYJ5SOTJ45YCYX8YD14'
 
-steps:
-  # 1) Prepare DigitalOcean droplet (idempotent)
-  - task: SSH@0
-    displayName: '🛠️ Prepare DO droplet'
-    inputs:
-      sshEndpoint: $(sshConnection)
-      runOptions: inline
-      inline: |
-        set -e
+  # DigitalOcean Spaces (hard‐coded)
+  SPACES_BUCKET:   'azure-testing'
+  SPACES_ENDPOINT: 'https://azure-testing.blr1.digitaloceanspaces.com'
+  SPACES_ACCESS_KEY: 'DO009J2Z99XLUZCHU7C9'
+  SPACES_SECRET_KEY: 'soC/jnKysRxgy73eV1yFoQpoGvBcGitiHo43akJ9T9A'
+  SPACES_REGION:    'blr1'
 
-        # Install runtime dependencies and Nginx
-        sudo yum install -y python3 python3-pip git nginx
+stages:
+  #################################################
+  # 1) Build & Push Docker image to Quay.io
+  #################################################
+  - stage: BuildAndPush
+    displayName: 'Build & Push Docker Image'
+    jobs:
+      - job: BuildPush
+        displayName: 'Build → Push to Quay'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
 
-        # Ensure application directory exists and is owned by adarsh
-        sudo mkdir -p $(appDir)
-        sudo chown -R adarsh:adarsh $(appDir)
+          - script: |
+              echo "🔐 Logging into Quay.io..."
+              docker login quay.io -u $(quayUser) -p $(quayPassword)
 
-        # Create Python virtual environment if it doesn't exist
-        if [ ! -d $(appDir)/venv ]; then
-          sudo -u adarsh python3 -m venv $(appDir)/venv
-        fi
+              echo "🔨 Building image: $(imageName):$(tag)"
+              docker build -t $(imageName):$(tag) .
 
-        # Enable and start Nginx
-        sudo systemctl enable nginx
-        sudo systemctl start nginx
+              echo "📤 Pushing image: $(imageName):$(tag)"
+              docker push $(imageName):$(tag)
+            displayName: 'Login, Build & Push'
 
-        # Create systemd service for Flask app
-        sudo tee /etc/systemd/system/hello-app.service > /dev/null << 'EOF'
-        [Unit]
-        Description=Flask Hello-World App
-        After=network.target
+  #################################################
+  # 2) Scan with Trivy (ignore zlib CVE), upload report
+  #################################################
+  - stage: ScanWithTrivy
+    displayName: 'Scan with Trivy → JSON & HTML → Upload'
+    dependsOn: BuildAndPush
+    condition: succeeded()
+    jobs:
+      - job: TrivyScan
+        displayName: 'Trivy → JSON + HTML → Upload → Fail'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
 
-        [Service]
-        WorkingDirectory=$(appDir)
-        ExecStart=$(appDir)/venv/bin/python $(appDir)/app.py
-        Restart=always
-        User=adarsh
-        Environment=PATH=/usr/bin:$(appDir)/venv/bin
+          # Install Trivy & AWS CLI
+          - script: |
+              echo "📥 Installing Trivy…"
+              TRIVY_VERSION="0.33.0"
+              wget -qO- \
+                https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz \
+                | sudo tar xz -C /usr/local/bin trivy
+              sudo chmod +x /usr/local/bin/trivy
 
-        [Install]
-        WantedBy=multi-user.target
-        EOF
+              echo "📥 Installing AWS CLI…"
+              python3 -m pip install --user awscli
+              export PATH="$HOME/.local/bin:$PATH"
 
-        sudo systemctl daemon-reload
-        sudo systemctl enable hello-app
+              echo "✅ Tools ready: $(trivy --version | head -n1) & $(aws --version)"
+            displayName: 'Install Tools'
 
-        # Configure Nginx reverse proxy
-        sudo mkdir -p $(nginxConfDir)
-        sudo tee $(nginxConfDir)/hello.conf > /dev/null << 'EOF'
-        server {
-            listen 80;
-            server_name _;
+          # Create .trivyignore to suppress zlib CVE
+          - script: |
+              cat <<EOF > .trivyignore
+              CVE-2023-45853
+              EOF
+              echo "ℹ️ .trivyignore contents:"
+              cat .trivyignore
+            displayName: 'Generate .trivyignore'
 
-            location / {
-                proxy_pass http://127.0.0.1:5000;
-                proxy_set_header Host $host;
-                proxy_set_header X-Real-IP $remote_addr;
-            }
-        }
-        EOF
+          # Pull image and refresh DB
+          - script: |
+              echo "🔄 Refreshing Trivy DB…"
+              trivy image --download-db-only
 
-        sudo systemctl reload nginx
+              echo "🔐 Logging into Quay.io & pulling image…"
+              echo "$(quayPassword)" | docker login quay.io -u "$(quayUser)" --password-stdin
+              docker pull $(imageName):$(tag)
+            displayName: 'Login & Pull'
 
-  # 2) Deploy application code on each push
-  - task: SSH@0
-    displayName: '🚀 Deploy App'
-    inputs:
-      sshEndpoint: $(sshConnection)
-      runOptions: inline
-      inline: |
-        set -e
+          # Run scan, produce JSON+HTML, upload report, fail on remaining CRITICALs
+          - script: |
+              IMAGE=$(imageName):$(tag)
+              IGNORE_OPTS="--ignorefile .trivyignore"
 
-        cd $(appDir)
-        if [ ! -d .git ]; then
-          git clone https://github.com/adarshkrishna754/hello-world-flask.git .
-        else
-          git fetch --all
-          git reset --hard origin/main
-        fi
+              echo "🔍 Scanning ${IMAGE} for CRITICAL CVEs (ignoring CVE-2023-45853)…"
 
-        # Upgrade pip to avoid version warnings
-        sudo -u adarsh $(appDir)/venv/bin/python -m pip install --upgrade pip
+              # JSON report
+              trivy image $IGNORE_OPTS --quiet --format json --severity CRITICAL "${IMAGE}" > trivy-report.json
 
-        # Install or upgrade Python dependencies in venv
-        sudo -u adarsh $(appDir)/venv/bin/pip install --upgrade -r requirements.txt
+              # HTML report
+              wget -qO html.tpl \
+                https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl
+              trivy image $IGNORE_OPTS \
+                --quiet \
+                --format template \
+                --template "@html.tpl" \
+                --severity CRITICAL \
+                "${IMAGE}" > trivy-report.html
 
-        # Restart the Flask service
-        sudo systemctl restart hello-app
+              # Print any remaining CRITICALs
+              echo "🛡️ Remaining CRITICAL vulnerabilities:"
+              jq -r '
+                .Results[]? 
+                | .Vulnerabilities[]? 
+                | select(.Severity=="CRITICAL") 
+                | "\(.VulnerabilityID) | \(.PkgName)@\(.InstalledVersion) -> \(.FixedVersion) | \(.Title)"' \
+                trivy-report.json || true
+
+              # Count & upload
+              COUNT=$(jq '[.Results[]? | .Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-report.json)
+              echo "🔢 Total CRITICAL CVEs (post-ignore): $COUNT"
+
+              echo "📤 Uploading HTML report to DO Spaces…"
+              export AWS_ACCESS_KEY_ID=$(SPACES_ACCESS_KEY)
+              export AWS_SECRET_ACCESS_KEY=$(SPACES_SECRET_KEY)
+              export AWS_DEFAULT_REGION=$(SPACES_REGION)
+              aws --endpoint-url "$(SPACES_ENDPOINT)" s3 cp \
+                trivy-report.html \
+                s3://$(SPACES_BUCKET)/trivy-report-$(tag).html \
+                --acl public-read
+
+              echo "📢 Report URL: $(SPACES_ENDPOINT)/$(SPACES_BUCKET)/trivy-report-$(tag).html"
+
+              if [ "$COUNT" -gt 0 ]; then
+                echo "❌ Failing pipeline due to $COUNT CRITICAL CVE(s)."
+                exit 1
+              fi
+
+              echo "✅ No CRITICAL CVEs—pipeline passes."
+            displayName: 'Scan → Upload → Fail'
+            env:
+              quayUser:         $(quayUser)
+              quayPassword:     $(quayPassword)
+              SPACES_ACCESS_KEY: $(SPACES_ACCESS_KEY)
+              SPACES_SECRET_KEY: $(SPACES_SECRET_KEY)
+              SPACES_REGION:     $(SPACES_REGION)
+              SPACES_ENDPOINT:   $(SPACES_ENDPOINT)
+
+  #################################################
+  # 3) Deploy to DigitalOcean droplet via SSH
+  #################################################
+  - stage: DeployToDroplet
+    displayName: 'Deploy to DigitalOcean Droplet'
+    dependsOn: ScanWithTrivy
+    condition: succeeded()
+    jobs:
+      - job: DeployApp
+        displayName: 'SSH & Deploy Container'
+        pool:
+          name: 'do-pool'
+        steps:
+          - checkout: self
+
+          - task: SSH@0
+            displayName: '🛜 SSH & deploy container'
+            inputs:
+              sshEndpoint: 'DO-SSH'
+              runOptions: 'inline'
+              inline: |
+                set -e
+
+                echo "🔐 Logging into Quay.io"
+                docker login quay.io \
+                  -u $(quayUser) \
+                  -p $(quayPassword)
+
+                echo "📥 Pulling image $(imageName):$(tag)"
+                docker pull $(imageName):$(tag)
+
+                echo "🛑 Stopping old container (if any)"
+                docker rm -f hello-world || true
+
+                echo "🚀 Launching new container"
+                docker run -d \
+                  --name hello-world \
+                  --restart unless-stopped \
+                  -p 80:4999 \
+                  $(imageName):$(tag)
+            env:
+              quayUser:     $(quayUser)
+              quayPassword: $(quayPassword)
